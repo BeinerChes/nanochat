@@ -32,6 +32,9 @@ class RechatConfig:
     n_layer: int = 12
     n_embd: int = 768
     chunk_size: int = 128  # parallel scan chunk size
+    far_weight: float = 0.0  # weight of far-future prediction loss (0 = disabled)
+    far_k_min: int = 32     # min distance for far-future prediction
+    far_k_max: int = 128    # max distance (randomized per batch)
 
 
 def norm(x):
@@ -179,6 +182,9 @@ class Rechat(nn.Module):
             "h": nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         })
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
+        # Far-future prediction head (only used during training)
+        if config.far_weight > 0:
+            self.far_head = Linear(config.n_embd, padded_vocab_size, bias=False)
 
     @torch.no_grad()
     def init_weights(self):
@@ -188,6 +194,8 @@ class Rechat(nn.Module):
         # Embedding and unembedding (same as nanochat GPT)
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.8)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        if self.config.far_weight > 0:
+            torch.nn.init.normal_(self.far_head.weight, mean=0.0, std=0.001)
 
         for block in self.transformer.h:
             # Recurrence
@@ -217,15 +225,17 @@ class Rechat(nn.Module):
     def num_scaling_params(self):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
+        far_head = sum(p.numel() for p in self.far_head.parameters()) if self.config.far_weight > 0 else 0
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        total = wte + lm_head + transformer_matrices
+        total = wte + lm_head + far_head + transformer_matrices
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
-            'value_embeds': 0,  # rechat has no value embeddings
+            'value_embeds': 0,
             'lm_head': lm_head,
+            'far_head': far_head,
             'transformer_matrices': transformer_matrices,
-            'scalars': 0,  # no more fixed decay scalars
+            'scalars': 0,
             'total': total,
         }
 
@@ -242,8 +252,9 @@ class Rechat(nn.Module):
 
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
+        far_head_params = list(self.far_head.parameters()) if self.config.far_weight > 0 else []
 
-        total_params = len(matrix_params) + len(embedding_params) + len(lm_head_params)
+        total_params = len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(far_head_params)
         assert total_params == len(list(self.parameters())), f"Parameter count mismatch: {total_params} vs {len(list(self.parameters()))}"
 
         # Scale LR by model dim (same as nanochat GPT)
@@ -255,6 +266,8 @@ class Rechat(nn.Module):
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
         ]
+        if far_head_params:
+            param_groups.append(dict(kind='adamw', params=far_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01))
         # Muon groups (all matrix params, grouped by shape)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -290,8 +303,19 @@ class Rechat(nn.Module):
         logits = softcap * torch.tanh(logits / softcap)
 
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
+            main_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+
+            # Far-future prediction: h[t] predicts token[t+K]
+            if self.config.far_weight > 0:
+                far_k = torch.randint(self.config.far_k_min, self.config.far_k_max + 1, ()).item()
+                if T > far_k:
+                    far_logits = self.far_head(x[:, :-far_k])
+                    far_logits = far_logits[..., :self.config.vocab_size].float()
+                    far_targets = idx[:, far_k:]  # token[t+K]
+                    far_loss = F.cross_entropy(far_logits.reshape(-1, far_logits.size(-1)), far_targets.reshape(-1), ignore_index=-1, reduction='mean')
+                    return main_loss + self.config.far_weight * far_loss
+
+            return main_loss
         else:
             return logits
 

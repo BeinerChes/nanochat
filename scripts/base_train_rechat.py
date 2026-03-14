@@ -45,6 +45,9 @@ parser.add_argument("--depth", type=int, default=4, help="depth of the model (nu
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--chunk-size", type=int, default=128, help="parallel scan chunk size")
+parser.add_argument("--far-weight", type=float, default=0.0, help="weight of far-future prediction loss (0 = disabled)")
+parser.add_argument("--far-k-min", type=int, default=32, help="min distance for far-future prediction")
+parser.add_argument("--far-k-max", type=int, default=128, help="max distance for far-future prediction")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -112,6 +115,9 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_embd=model_dim,
         chunk_size=args.chunk_size,
+        far_weight=args.far_weight,
+        far_k_min=args.far_k_min,
+        far_k_max=args.far_k_max,
     )
     with torch.device("meta"):
         model_meta = Rechat(config)

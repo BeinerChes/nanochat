@@ -1,27 +1,42 @@
 """
-Memory retention test: can the model remember a character name through filler text?
+Deterministic memory retention test via logit probing.
+
+No generation, no sampling, no randomness. One forward pass per test.
 
 Setup:
-  "Once upon a time there was a girl named Zephyr. She loved to paint."
-  + [N tokens of filler from TinyStories]
-  → generate 100 tokens
-  → does "Zephyr" appear in the output?
+  "Once upon a time there was a girl named Lily." + [N filler tokens] + "The girl's name was"
+  → check: what rank/probability does "Lily" get in next-token logits?
 
-Tests Rechat and GPT at varying filler lengths.
+Tests multiple fact types, averages across them, plots smooth decay curves.
 """
 
+import math
 import os
 import json
 import torch
-from nanochat.common import compute_init, autodetect_device_type, get_base_dir
+import torch.nn.functional as F
+from nanochat.common import compute_init, autodetect_device_type, get_base_dir, COMPUTE_DTYPE
 from nanochat.tokenizer import get_tokenizer
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.rechat import Rechat, RechatConfig
 from nanochat.rechat_recall import RechatRecall, RechatRecallConfig
+from nanochat.mingru import MinGRU, MinGRUConfig
+
+
+def find_latest_step(checkpoint_dir):
+    """Find the latest checkpoint step in a directory."""
+    steps = []
+    for f in os.listdir(checkpoint_dir):
+        if f.startswith("meta_") and f.endswith(".json"):
+            step = int(f.replace("meta_", "").replace(".json", ""))
+            steps.append(step)
+    return max(steps) if steps else None
 
 
 def load_model_generic(checkpoint_dir, step, device, model_class, config_class):
-    """Load any model type from checkpoint."""
+    """Load any model type from checkpoint. step=-1 for latest."""
+    if step == -1:
+        step = find_latest_step(checkpoint_dir)
     model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
     meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
     with open(meta_path) as f:
@@ -39,32 +54,85 @@ def load_model_generic(checkpoint_dir, step, device, model_class, config_class):
     return model
 
 
+# --- Test cases: (setup, filler-free probe, target_word) ---
+# Each test: feed [setup + filler + probe], check P(target) at the last position.
+# target_word must be a single token (with leading space).
+TEST_CASES = [
+    {
+        "setup": "Once upon a time there was a girl named Lily.",
+        "probe": " The girl's name was",
+        "target": " Lily",
+        "label": "name:Lily",
+    },
+    {
+        "setup": "There was a boy called Max who liked to run.",
+        "probe": " The boy's name was",
+        "target": " Max",
+        "label": "name:Max",
+    },
+    {
+        "setup": "Once upon a time there was a boy named Tim.",
+        "probe": " The boy's name was",
+        "target": " Tim",
+        "label": "name:Tim",
+    },
+    {
+        "setup": "Sam had a big red ball that he loved.",
+        "probe": " The ball was",
+        "target": " red",
+        "label": "color:red",
+    },
+    {
+        "setup": "Mia found a blue flower in the garden.",
+        "probe": " The flower was",
+        "target": " blue",
+        "label": "color:blue",
+    },
+    {
+        "setup": "Ben had a small cat named Rex.",
+        "probe": " Ben's pet was a",
+        "target": " cat",
+        "label": "animal:cat",
+    },
+    {
+        "setup": "Lily went to the park with her dog.",
+        "probe": " Lily went to the",
+        "target": " park",
+        "label": "place:park",
+    },
+    {
+        "setup": "The happy bird sang a song in the tree.",
+        "probe": " The bird was",
+        "target": " happy",
+        "label": "mood:happy",
+    },
+]
+
+
 def get_filler_tokens(tokenizer, num_tokens):
-    """Get filler text tokens from TinyStories-like content."""
-    # Generic children's story filler that won't mention "Zephyr"
+    """Get filler text tokens."""
     filler_sentences = [
         "The sun was shining bright in the sky.",
-        "There were many trees in the park.",
-        "The birds were singing a happy song.",
-        "A little cat sat on the fence and watched.",
-        "The flowers were red and yellow and blue.",
+        "There were many trees in the forest.",
+        "The birds were singing a beautiful song.",
+        "A little squirrel sat on the fence and watched.",
+        "The flowers were pink and yellow and white.",
         "It was a very nice day to play outside.",
         "The children were running and laughing.",
-        "A big bear was sleeping under the tree.",
+        "A bear was sleeping under the old oak.",
         "The wind blew softly through the leaves.",
-        "There was a pond with little fish swimming.",
-        "The butterfly flew from flower to flower.",
+        "There was a pond with fish swimming around.",
+        "The butterfly flew from petal to petal.",
         "A rabbit hopped across the green grass.",
         "The clouds looked like fluffy white pillows.",
         "Some ducks were swimming in the lake.",
         "The ice cream truck came down the street.",
-        "A friendly squirrel climbed up the oak tree.",
+        "A friendly mouse climbed up the wooden stairs.",
         "The garden had many pretty roses growing.",
         "Two frogs were sitting on a lily pad.",
         "The old bridge crossed over the river.",
         "A ladybug landed on a big green leaf.",
     ]
-    # Tokenize all filler and repeat until we have enough
     all_tokens = []
     i = 0
     while len(all_tokens) < num_tokens:
@@ -74,35 +142,63 @@ def get_filler_tokens(tokenizer, num_tokens):
     return all_tokens[:num_tokens]
 
 
-def run_retention_test(model, tokenizer, filler_lengths, gen_tokens=100, num_tries=3):
-    """Test if the model retains 'Zephyr' through varying amounts of filler."""
-    bos = tokenizer.get_bos_token_id()
-    prompt = "Once upon a time there was a little dog. The dog loved to play with his big red ball."
-    prompt_tokens = tokenizer.encode(prompt, prepend=bos)
+def bits_retained(rank, vocab_size=32768):
+    """How many bits of the original info survive. 15 = perfect, 0 = random."""
+    max_bits = math.log2(vocab_size)
+    return max(0, max_bits - math.log2(rank))
 
-    results = []
+
+@torch.inference_mode()
+def probe_retention(model, tokenizer, test_cases, filler_lengths):
+    """
+    For each test case and filler length:
+    - Encode: [BOS] + setup + filler + probe
+    - Get logits at last position
+    - Report rank, probability, log-prob, and bits retained
+    """
+    bos = tokenizer.get_bos_token_id()
+    device = model.get_device()
+    vocab_size = 32768
+    results = {}  # filler_len -> list of (rank, prob, logprob, bits, label)
+
     for filler_len in filler_lengths:
         filler = get_filler_tokens(tokenizer, filler_len)
-        input_tokens = prompt_tokens + filler
+        results[filler_len] = []
 
-        hits = 0
-        outputs = []
-        for trial in range(num_tries):
-            generated = []
-            for tok in model.generate(input_tokens, max_tokens=gen_tokens, temperature=0.8, top_k=40, seed=42 + trial):
-                generated.append(tok)
-            text = tokenizer.decode(generated)
-            has_name = "dog" in text.lower()
-            if has_name:
-                hits += 1
-            outputs.append(text)
+        for tc in test_cases:
+            setup_tokens = tokenizer.encode(tc["setup"], prepend=bos)
+            probe_tokens = tokenizer.encode(tc["probe"])
+            target_tokens = tokenizer.encode(tc["target"])
 
-        total_input = len(input_tokens)
-        results.append((filler_len, total_input, hits, num_tries, outputs))
-        hit_str = f"{hits}/{num_tries}"
-        print(f"  filler={filler_len:4d} tokens (total input={total_input:4d}) | dog recalled: {hit_str}")
-        # Show first output
-        print(f"    → {outputs[0][:150]}")
+            if len(target_tokens) != 1:
+                print(f"  WARNING: '{tc['target']}' is {len(target_tokens)} tokens, skipping")
+                continue
+            target_id = target_tokens[0]
+
+            input_tokens = setup_tokens + filler + probe_tokens
+            ids = torch.tensor([input_tokens], dtype=torch.long, device=device)
+
+            logits = model(ids)  # (1, T, vocab)
+            last_logits = logits[0, -1, :]
+
+            probs = F.softmax(last_logits, dim=-1)
+            target_prob = probs[target_id].item()
+            logprob = math.log2(max(target_prob, 1e-10))
+
+            rank = (last_logits > last_logits[target_id]).sum().item() + 1
+            bits = bits_retained(rank, vocab_size)
+
+            results[filler_len].append((rank, target_prob, logprob, bits, tc["label"]))
+
+        ranks = [r[0] for r in results[filler_len]]
+        bits_list = [r[3] for r in results[filler_len]]
+        logprobs = [r[2] for r in results[filler_len]]
+        avg_bits = sum(bits_list) / len(bits_list)
+        avg_logprob = sum(logprobs) / len(logprobs)
+        median_rank = sorted(ranks)[len(ranks) // 2]
+
+        detail = "  ".join(f"{r[4]}:{r[3]:.1f}b" for r in results[filler_len])
+        print(f"  filler={filler_len:4d} | bits={avg_bits:5.1f}/15  log2p={avg_logprob:6.1f}  med_rank={median_rank:5d} | {detail}")
 
     return results
 
@@ -114,45 +210,50 @@ def main():
     base_dir = get_base_dir()
     checkpoints = os.path.join(base_dir, "base_checkpoints")
 
-    filler_lengths = [0, 50, 100, 200, 400]
+    filler_lengths = [0, 32, 64, 128, 256, 512, 1024]
 
-    # --- GPT d4 ---
-    gpt_dir = os.path.join(checkpoints, "d4")
-    if os.path.exists(gpt_dir):
-        print("\n=== GPT d4 ===")
-        gpt = load_model_generic(gpt_dir, 5000, device, GPT, GPTConfig)
-        run_retention_test(gpt, tokenizer, filler_lengths)
-        del gpt
+    models_to_test = [
+        ("GPT d4 (37M)", "d4", GPT, GPTConfig),
+        ("Rechat d6 (far, 48M)", "rechat_d6", Rechat, RechatConfig),
+        ("Rechat d11 (nofar, 112M)", "rechat_d11_nofar", Rechat, RechatConfig),
+        ("Rechat d11 (far, 135M)", "rechat_d11", Rechat, RechatConfig),
+        ("Rechat d4 (far, 28M)", "rechat_d4", Rechat, RechatConfig),
+        ("RechatRecall d4 (28M)", "recall_d4", RechatRecall, RechatRecallConfig),
+        ("MinGRU d13", "mingru_d13", MinGRU, MinGRUConfig),
+    ]
+
+    all_results = {}
+    for name, dirname, model_class, config_class in models_to_test:
+        model_dir = os.path.join(checkpoints, dirname)
+        if not os.path.exists(model_dir):
+            continue
+        print(f"\n=== {name} ===")
+        model = load_model_generic(model_dir, -1, device, model_class, config_class)
+        all_results[name] = probe_retention(model, tokenizer, TEST_CASES, filler_lengths)
+        del model
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    # --- Rechat d4 ---
-    rechat4_dir = os.path.join(checkpoints, "rechat_d4")
-    if os.path.exists(rechat4_dir):
-        print("\n=== Rechat d4 ===")
-        rec4 = load_model_generic(rechat4_dir, 5000, device, Rechat, RechatConfig)
-        run_retention_test(rec4, tokenizer, filler_lengths)
-        del rec4
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-
-    # --- Rechat d11 ---
-    rechat11_dir = os.path.join(checkpoints, "rechat_d11")
-    if os.path.exists(rechat11_dir):
-        print("\n=== Rechat d11 ===")
-        rec11 = load_model_generic(rechat11_dir, 5000, device, Rechat, RechatConfig)
-        run_retention_test(rec11, tokenizer, filler_lengths)
-        del rec11
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-
-    # --- RechatRecall d4 ---
-    recall_dir = os.path.join(checkpoints, "recall_d4")
-    if os.path.exists(recall_dir):
-        print("\n=== RechatRecall d4 (aux retention loss) ===")
-        recall = load_model_generic(recall_dir, 5000, device, RechatRecall, RechatRecallConfig)
-        run_retention_test(recall, tokenizer, filler_lengths)
-        del recall
+    # Summary table: avg bits retained
+    print("\n" + "=" * 70)
+    print("SUMMARY: Average bits retained (out of 15 = perfect)")
+    print("=" * 70)
+    header = f"{'Filler':>8}"
+    for name in all_results:
+        short = name.split("(")[0].strip()[:12]
+        header += f" | {short:>12}"
+    print(header)
+    print("-" * len(header))
+    for fl in filler_lengths:
+        row = f"{fl:>8}"
+        for name, results in all_results.items():
+            if fl in results:
+                bits_list = [r[3] for r in results[fl]]
+                avg_bits = sum(bits_list) / len(bits_list)
+                row += f" | {avg_bits:>11.1f}b"
+            else:
+                row += f" | {'N/A':>12}"
+        print(row)
 
 
 if __name__ == "__main__":
